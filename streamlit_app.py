@@ -278,10 +278,17 @@ def page_analytics(df: pd.DataFrame) -> None:
 
     base = filter_equal(df, "dictionary", dictionary)
 
-    publications = ["Все"] + sorted_values(base["publication"])
+    publications = sorted_values(base["publication"])
     with c2:
-        publication = st.selectbox("Журнал", publications, key="an_publication")
-    base = filter_equal(base, "publication", publication)
+        selected_publications = st.multiselect(
+            "Журналы",
+            options=publications,
+            default=[],
+            key="an_publications",
+            placeholder="Все издания",
+            help="Можно выбрать несколько изданий. Если ничего не выбрано, используются все издания.",
+        )
+    base = filter_multi(base, "publication", selected_publications)
 
     with c3:
         period = st.selectbox(
