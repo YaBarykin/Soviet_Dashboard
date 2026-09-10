@@ -265,7 +265,7 @@ def page_texts(df: pd.DataFrame) -> None:
 
 
 def page_analytics(df: pd.DataFrame) -> None:
-    st.subheader("Аналитика")
+    st.subheader("Анализ категорий")
 
     c1, c2, c3, c4 = st.columns([1.1, 1.1, 0.9, 1.6])
 
@@ -410,18 +410,163 @@ def page_analytics(df: pd.DataFrame) -> None:
         st.caption("Количество считается по уникальным сочетаниям «издание + sentence_id», как мера Sentences Count в исходном Power BI.")
 
 
+
+def page_publication_analytics(df: pd.DataFrame) -> None:
+    st.subheader("Аналитика изданий")
+
+    c1, c2, c3, c4, c5 = st.columns([0.95, 1.8, 1.5, 0.9, 1.45])
+
+    dimension_labels = {
+        "Словарь": "dictionary",
+        "Категория": "category",
+        "Термин": "matched_term",
+    }
+    with c1:
+        dimension_label = st.selectbox(
+            "Что анализируем",
+            options=list(dimension_labels),
+            key="pub_dimension",
+        )
+    dimension = dimension_labels[dimension_label]
+
+    available_values = sorted_values(df[dimension])
+    with c2:
+        selected_values = st.multiselect(
+            dimension_label,
+            options=available_values,
+            default=[],
+            key="pub_values",
+            placeholder=f"Все: {dimension_label.lower()}",
+            help=(
+                "Можно выбрать одно или несколько значений. "
+                "Если ничего не выбрано, используются все значения выбранного уровня."
+            ),
+        )
+
+    base = filter_multi(df, dimension, selected_values)
+
+    publications = sorted_values(base["publication"])
+    with c3:
+        selected_publications = st.multiselect(
+            "Издания",
+            options=publications,
+            default=[],
+            key="pub_publications",
+            placeholder="Все издания",
+            help="Можно выбрать одно или несколько изданий. Если ничего не выбрано, используются все издания.",
+        )
+    base = filter_multi(base, "publication", selected_publications)
+
+    with c4:
+        period = st.selectbox(
+            "Период",
+            ["Все", "До 1991 включительно", "После 1991"],
+            key="pub_period",
+        )
+    base = filter_equal(base, "period", period)
+
+    ymin, ymax = year_bounds(base if not base.empty else df)
+    with c5:
+        years = st.slider("Год", ymin, ymax, (ymin, ymax), key="pub_years")
+
+    base = base[base["year"].notna()].copy()
+    base = base[(base["year"].astype(int) >= years[0]) & (base["year"].astype(int) <= years[1])]
+
+    if base.empty:
+        st.info("По выбранным фильтрам данных нет.")
+        return
+
+    # One bar per publication: number of distinct sentences containing any selected value.
+    bar_data = (
+        base.groupby("publication", as_index=False)["unique_sentence_id"]
+        .nunique()
+        .rename(columns={"unique_sentence_id": "count"})
+        .sort_values("count", ascending=False)
+    )
+
+    st.markdown("### Частота упоминаний по изданиям")
+    fig_bar = px.bar(
+        bar_data,
+        x="publication",
+        y="count",
+        labels={"publication": "Издание", "count": "Количество упоминаний"},
+        text_auto=True,
+    )
+    fig_bar.update_traces(hovertemplate="%{x}: %{y}<extra></extra>")
+    fig_bar.update_layout(
+        height=430,
+        margin=dict(l=15, r=15, t=10, b=10),
+        showlegend=False,
+    )
+    fig_bar.update_xaxes(categoryorder="total descending")
+    st.plotly_chart(fig_bar, use_container_width=True, config={"displayModeBar": False})
+
+    # Yearly dynamics with publications as lines. Fill missing publication/year combinations with zeros
+    # so the chart does not connect non-adjacent observations across years with no mentions.
+    line_counts = (
+        base.groupby(["year", "publication"], as_index=False)["unique_sentence_id"]
+        .nunique()
+        .rename(columns={"unique_sentence_id": "count"})
+    )
+
+    active_publications = bar_data["publication"].astype(str).tolist()
+    all_years = list(range(years[0], years[1] + 1))
+    full_index = pd.MultiIndex.from_product(
+        [all_years, active_publications],
+        names=["year", "publication"],
+    )
+    line_data = (
+        line_counts.assign(
+            year=line_counts["year"].astype(int),
+            publication=line_counts["publication"].astype(str),
+        )
+        .set_index(["year", "publication"])
+        .reindex(full_index, fill_value=0)
+        .reset_index()
+        .sort_values(["publication", "year"])
+    )
+
+    st.markdown("### Динамика упоминаний по годам")
+    fig_line = px.line(
+        line_data,
+        x="year",
+        y="count",
+        color="publication",
+        markers=False,
+        labels={"year": "Год", "count": "Количество упоминаний", "publication": "Издание"},
+    )
+    fig_line.update_traces(hovertemplate="%{fullData.name}: %{y}<extra></extra>")
+    fig_line.update_layout(
+        height=650,
+        hovermode="x unified",
+        margin=dict(l=15, r=15, t=10, b=10),
+        legend_title_text="Издание",
+    )
+    fig_line.update_xaxes(dtick=5)
+    st.plotly_chart(fig_line, use_container_width=True, config={"displayModeBar": True})
+
+    selection_text = ", ".join(selected_values) if selected_values else "все значения"
+    st.caption(
+        f"Уровень анализа: {dimension_label.lower()}; выбрано: {selection_text}. "
+        "Количество считается по уникальным сочетаниям «издание + sentence_id»."
+    )
+
+
 def main() -> None:
     require_shared_password()
     df = load_data()
 
     st.title("Анализ советских журналов")
-    st.caption("Перенесено из Power BI: страницы «Тексты» и «Аналитика», каскадные фильтры и основные визуализации.")
 
-    tab_texts, tab_analytics = st.tabs(["Тексты", "Аналитика"])
+    tab_texts, tab_analytics, tab_publications = st.tabs(
+        ["Тексты", "Анализ категорий", "Аналитика изданий"]
+    )
     with tab_texts:
         page_texts(df)
     with tab_analytics:
         page_analytics(df)
+    with tab_publications:
+        page_publication_analytics(df)
 
 
 if __name__ == "__main__":
