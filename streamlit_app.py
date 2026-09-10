@@ -535,7 +535,37 @@ def page_publication_analytics(df: pd.DataFrame) -> None:
         markers=False,
         labels={"year": "Год", "count": "Количество упоминаний", "publication": "Издание"},
     )
-    fig_line.update_traces(hovertemplate="%{fullData.name}: %{y}<extra></extra>")
+    # Plotly does not dynamically sort entries in a standard unified hover tooltip.
+    # Hide the native per-trace hover rows and add one invisible helper trace whose
+    # tooltip is pre-sorted by count (descending) separately for every year.
+    fig_line.update_traces(hoverinfo="skip")
+
+    hover_rows = []
+    hover_y = []
+    for year in all_years:
+        year_data = (
+            line_data[line_data["year"] == year][["publication", "count"]]
+            .sort_values(["count", "publication"], ascending=[False, True])
+        )
+        hover_rows.append(
+            "<br>".join(
+                f"{publication}: {int(count)}"
+                for publication, count in year_data.itertuples(index=False, name=None)
+            )
+        )
+        hover_y.append(int(year_data["count"].max()) if not year_data.empty else 0)
+
+    fig_line.add_scatter(
+        x=all_years,
+        y=hover_y,
+        mode="markers",
+        marker=dict(size=10, opacity=0),
+        customdata=hover_rows,
+        hovertemplate="%{customdata}<extra></extra>",
+        showlegend=False,
+        name="",
+    )
+
     fig_line.update_layout(
         height=650,
         hovermode="x unified",
