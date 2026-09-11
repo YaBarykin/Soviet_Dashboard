@@ -84,7 +84,8 @@ def normalize_data(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError("Не хватает столбцов: " + ", ".join(missing))
 
-    out = df[REQUIRED_COLUMNS].copy()
+    columns_to_keep = REQUIRED_COLUMNS + (["emotion"] if "emotion" in df.columns else [])
+    out = df[columns_to_keep].copy()
     out["year"] = pd.to_numeric(out["year"], errors="coerce").astype("Int64")
     out["sentence_id"] = pd.to_numeric(out["sentence_id"], errors="coerce").astype("Int64")
 
@@ -98,7 +99,10 @@ def normalize_data(df: pd.DataFrame) -> pd.DataFrame:
     out.loc[out["year"].notna() & (out["year"] <= 1991), "period"] = "До 1991 включительно"
     out.loc[out["year"].notna() & (out["year"] > 1991), "period"] = "После 1991"
 
-    for col in ["publication", "dictionary", "category", "matched_term"]:
+    text_columns = ["publication", "dictionary", "category", "matched_term"]
+    if "emotion" in out.columns:
+        text_columns.append("emotion")
+    for col in text_columns:
         out[col] = out[col].astype("string")
     return out
 
@@ -582,14 +586,148 @@ def page_publication_analytics(df: pd.DataFrame) -> None:
     )
 
 
+
+def page_attitudes(df: pd.DataFrame) -> None:
+    st.subheader("Отношение")
+
+    if "emotion" not in df.columns:
+        st.warning(
+            "В данных нет колонки emotion. Добавьте её в исходный CSV/XLSX/Parquet, "
+            "чтобы построить распределение отношений."
+        )
+        return
+
+    target_dictionaries = [
+        "Отношение американцев к СССР/России",
+        "Отношение к США",
+    ]
+
+    available_target_dictionaries = set(df["dictionary"].dropna().astype(str).unique())
+    missing_dictionaries = [
+        dictionary for dictionary in target_dictionaries
+        if dictionary not in available_target_dictionaries
+    ]
+    if missing_dictionaries:
+        st.warning(
+            "В данных не найдены словари: " + ", ".join(missing_dictionaries)
+        )
+
+    relation_base = df[df["dictionary"].astype("string").isin(target_dictionaries)].copy()
+    if relation_base.empty:
+        st.info("Для двух выбранных словарей данных нет.")
+        return
+
+    c1, c2, c3 = st.columns([1.6, 0.9, 1.5])
+
+    publications = sorted_values(relation_base["publication"])
+    with c1:
+        selected_publications = st.multiselect(
+            "Издания",
+            options=publications,
+            default=[],
+            key="rel_publications",
+            placeholder="Все издания",
+            help="Можно выбрать одно или несколько изданий. Если ничего не выбрано, используются все издания.",
+        )
+    relation_base = filter_multi(relation_base, "publication", selected_publications)
+
+    with c2:
+        period = st.selectbox(
+            "Период",
+            ["Все", "До 1991 включительно", "После 1991"],
+            key="rel_period",
+        )
+    relation_base = filter_equal(relation_base, "period", period)
+
+    ymin, ymax = year_bounds(relation_base if not relation_base.empty else df)
+    with c3:
+        years = st.slider("Год", ymin, ymax, (ymin, ymax), key="rel_years")
+
+    relation_base = relation_base[relation_base["year"].notna()].copy()
+    relation_base = relation_base[
+        (relation_base["year"].astype(int) >= years[0])
+        & (relation_base["year"].astype(int) <= years[1])
+    ]
+    relation_base = relation_base.dropna(subset=["emotion"])
+    relation_base = relation_base[relation_base["emotion"].astype(str).str.strip() != ""]
+
+    if relation_base.empty:
+        st.info("По выбранным фильтрам данных нет.")
+        return
+
+    left, right = st.columns(2)
+
+    def render_emotion_pie(container, dictionary: str, title: str) -> None:
+        subset = relation_base[
+            relation_base["dictionary"].astype("string") == dictionary
+        ]
+
+        with container:
+            st.markdown(f"### {title}")
+            if subset.empty:
+                st.info("По выбранным фильтрам данных нет.")
+                return
+
+            pie_data = (
+                subset.groupby("emotion", as_index=False)["unique_sentence_id"]
+                .nunique()
+                .rename(columns={"unique_sentence_id": "count"})
+                .sort_values("count", ascending=False)
+            )
+
+            fig = px.pie(
+                pie_data,
+                names="emotion",
+                values="count",
+                hole=0,
+            )
+            fig.update_traces(
+                textinfo="percent+label",
+                hovertemplate=(
+                    "%{label}<br>"
+                    "%{value} предложений<br>"
+                    "%{percent}<extra></extra>"
+                ),
+            )
+            fig.update_layout(
+                height=520,
+                margin=dict(l=5, r=5, t=10, b=5),
+                legend_title_text="Отношение",
+            )
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+                config={"displayModeBar": False},
+            )
+
+            total = subset["unique_sentence_id"].nunique(dropna=True)
+            st.caption(
+                f"Уникальных предложений: {total:,}".replace(",", " ")
+            )
+
+    render_emotion_pie(
+        left,
+        "Отношение американцев к СССР/России",
+        "Отношение американцев к СССР/России",
+    )
+    render_emotion_pie(
+        right,
+        "Отношение к США",
+        "Отношение к США",
+    )
+
+    st.caption(
+        "Доли рассчитываются по уникальным сочетаниям «издание + sentence_id» внутри каждой категории emotion."
+    )
+
 def main() -> None:
     require_shared_password()
     df = load_data()
 
     st.title("Анализ советских журналов")
 
-    tab_texts, tab_analytics, tab_publications = st.tabs(
-        ["Тексты", "Анализ категорий", "Аналитика изданий"]
+    tab_texts, tab_analytics, tab_publications, tab_attitudes = st.tabs(
+        ["Тексты", "Анализ категорий", "Аналитика изданий", "Отношение"]
     )
     with tab_texts:
         page_texts(df)
@@ -597,6 +735,8 @@ def main() -> None:
         page_analytics(df)
     with tab_publications:
         page_publication_analytics(df)
+    with tab_attitudes:
+        page_attitudes(df)
 
 
 if __name__ == "__main__":
