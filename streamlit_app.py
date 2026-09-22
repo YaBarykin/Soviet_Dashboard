@@ -84,7 +84,8 @@ def normalize_data(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError("Не хватает столбцов: " + ", ".join(missing))
 
-    columns_to_keep = REQUIRED_COLUMNS + (["emotion"] if "emotion" in df.columns else [])
+    optional_columns = [c for c in ["emotion", "attitude"] if c in df.columns]
+    columns_to_keep = REQUIRED_COLUMNS + optional_columns
     out = df[columns_to_keep].copy()
     out["year"] = pd.to_numeric(out["year"], errors="coerce").astype("Int64")
     out["sentence_id"] = pd.to_numeric(out["sentence_id"], errors="coerce").astype("Int64")
@@ -100,8 +101,9 @@ def normalize_data(df: pd.DataFrame) -> pd.DataFrame:
     out.loc[out["year"].notna() & (out["year"] > 1991), "period"] = "После 1991"
 
     text_columns = ["publication", "dictionary", "category", "matched_term"]
-    if "emotion" in out.columns:
-        text_columns.append("emotion")
+    for optional_col in ["emotion", "attitude"]:
+        if optional_col in out.columns:
+            text_columns.append(optional_col)
     for col in text_columns:
         out[col] = out[col].astype("string")
     return out
@@ -731,36 +733,36 @@ def page_attitudes(df: pd.DataFrame) -> None:
 
 
 def page_us_emotions(df: pd.DataFrame) -> None:
-    st.subheader("Эмоции")
+    st.subheader("Эмоции и отношение")
 
     if df.empty:
         st.info("Данные американских публикаций не загружены.")
         return
-    if "emotion" not in df.columns:
-        st.warning("В all_publications_us.parquet нет колонки emotion.")
-        return
 
-    # Основной словарь с классификацией эмоций американских авторов.
-    emotion_dictionary = "american_author_emotions_to_russia"
+    author_dictionary = "american_author_emotions_to_russia"
+    imagined_dictionary = "imagined_russian_attitudes_to_usa"
+
     available = set(df["dictionary"].dropna().astype(str).unique())
-    if emotion_dictionary in available:
-        base = df[df["dictionary"].astype("string") == emotion_dictionary].copy()
-    else:
-        # Fallback: если название словаря было изменено, используем все строки,
-        # где emotion действительно заполнена.
-        base = df[df["emotion"].notna()].copy()
-        base = base[base["emotion"].astype(str).str.strip() != ""]
-        st.caption(
-            f"Словарь {emotion_dictionary} не найден; показаны все записи с заполненной emotion."
-        )
+    missing = [
+        name for name in [author_dictionary, imagined_dictionary]
+        if name not in available
+    ]
+    if missing:
+        st.warning("В данных не найдены словари: " + ", ".join(missing))
 
-    if base.empty:
-        st.info("В американских публикациях нет записей с эмоциями.")
+    relation_base = df[
+        df["dictionary"].astype("string").isin(
+            [author_dictionary, imagined_dictionary]
+        )
+    ].copy()
+
+    if relation_base.empty:
+        st.info("Для словарей с эмоциями и отношением данных нет.")
         return
 
     c1, c2, c3 = st.columns([1.6, 0.9, 1.5])
 
-    publications = sorted_values(base["publication"])
+    publications = sorted_values(relation_base["publication"])
     with c1:
         selected_publications = st.multiselect(
             "Издания",
@@ -770,7 +772,7 @@ def page_us_emotions(df: pd.DataFrame) -> None:
             placeholder="Все издания",
             help="Если ничего не выбрано, используются все издания.",
         )
-    base = filter_multi(base, "publication", selected_publications)
+    relation_base = filter_multi(relation_base, "publication", selected_publications)
 
     with c2:
         period = st.selectbox(
@@ -778,57 +780,101 @@ def page_us_emotions(df: pd.DataFrame) -> None:
             ["Все", "До 1991 включительно", "После 1991"],
             key="us_em_period",
         )
-    base = filter_equal(base, "period", period)
+    relation_base = filter_equal(relation_base, "period", period)
 
-    ymin, ymax = year_bounds(base if not base.empty else df)
+    ymin, ymax = year_bounds(relation_base if not relation_base.empty else df)
     with c3:
         years = st.slider("Год", ymin, ymax, (ymin, ymax), key="us_em_years")
 
-    base = base[base["year"].notna()].copy()
-    base = base[
-        (base["year"].astype(int) >= years[0])
-        & (base["year"].astype(int) <= years[1])
+    relation_base = relation_base[relation_base["year"].notna()].copy()
+    relation_base = relation_base[
+        (relation_base["year"].astype(int) >= years[0])
+        & (relation_base["year"].astype(int) <= years[1])
     ]
-    base = base.dropna(subset=["emotion"])
-    base = base[base["emotion"].astype(str).str.strip() != ""]
 
-    if base.empty:
+    if relation_base.empty:
         st.info("По выбранным фильтрам данных нет.")
         return
 
-    pie_data = (
-        base.groupby("emotion", as_index=False)["unique_sentence_id"]
-        .nunique()
-        .rename(columns={"unique_sentence_id": "count"})
-        .sort_values("count", ascending=False)
+    left, right = st.columns(2)
+
+    def render_pie(
+        container,
+        dictionary: str,
+        value_column: str,
+        title: str,
+        legend_title: str,
+    ) -> None:
+        with container:
+            st.markdown(f"### {title}")
+
+            if value_column not in relation_base.columns:
+                st.warning(f"В данных нет колонки {value_column}.")
+                return
+
+            subset = relation_base[
+                relation_base["dictionary"].astype("string") == dictionary
+            ].copy()
+            subset = subset.dropna(subset=[value_column])
+            subset = subset[subset[value_column].astype(str).str.strip() != ""]
+
+            if subset.empty:
+                st.info("По выбранным фильтрам данных нет.")
+                return
+
+            pie_data = (
+                subset.groupby(value_column, as_index=False)["unique_sentence_id"]
+                .nunique()
+                .rename(columns={"unique_sentence_id": "count"})
+                .sort_values("count", ascending=False)
+            )
+
+            fig = px.pie(
+                pie_data,
+                names=value_column,
+                values="count",
+                hole=0,
+            )
+            fig.update_traces(
+                textinfo="percent+label",
+                hovertemplate=(
+                    "%{label}<br>"
+                    "%{value} предложений<br>"
+                    "%{percent}<extra></extra>"
+                ),
+            )
+            fig.update_layout(
+                height=520,
+                margin=dict(l=5, r=5, t=10, b=5),
+                legend_title_text=legend_title,
+            )
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+                config={"displayModeBar": False},
+            )
+
+            total = subset["unique_sentence_id"].nunique(dropna=True)
+            st.caption(f"Уникальных предложений: {total:,}".replace(",", " "))
+
+    render_pie(
+        left,
+        author_dictionary,
+        "emotion",
+        "Эмоции американских авторов по отношению к СССР/России",
+        "Эмоция",
+    )
+    render_pie(
+        right,
+        imagined_dictionary,
+        "attitude",
+        "Воображаемое отношение русских к США",
+        "Отношение",
     )
 
-    left, right = st.columns([1.35, 1.0])
-    with left:
-        st.markdown("### Эмоции американских авторов по отношению к СССР/России")
-        fig = px.pie(pie_data, names="emotion", values="count", hole=0)
-        fig.update_traces(
-            textinfo="percent+label",
-            hovertemplate=(
-                "%{label}<br>%{value} предложений<br>%{percent}<extra></extra>"
-            ),
-        )
-        fig.update_layout(
-            height=540,
-            margin=dict(l=5, r=5, t=10, b=5),
-            legend_title_text="Эмоция",
-        )
-        st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
-
-    with right:
-        st.markdown("### Количество по эмоциям")
-        display = pie_data.rename(columns={"emotion": "Эмоция", "count": "Предложения"})
-        st.dataframe(display, use_container_width=True, hide_index=True)
-
-    total = base["unique_sentence_id"].nunique(dropna=True)
     st.caption(
-        (f"Уникальных предложений: {total:,}. ".replace(",", " "))
-        + "Доли считаются по уникальным сочетаниям «издание + sentence_id»."
+        "Доли рассчитываются по уникальным сочетаниям «издание + sentence_id» "
+        "отдельно для каждого словаря."
     )
 
 def main() -> None:
