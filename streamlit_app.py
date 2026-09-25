@@ -84,7 +84,8 @@ def normalize_data(df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         raise ValueError("Не хватает столбцов: " + ", ".join(missing))
 
-    columns_to_keep = REQUIRED_COLUMNS + (["emotion"] if "emotion" in df.columns else [])
+    optional_columns = [c for c in ["emotion", "attitude"] if c in df.columns]
+    columns_to_keep = REQUIRED_COLUMNS + optional_columns
     out = df[columns_to_keep].copy()
     out["year"] = pd.to_numeric(out["year"], errors="coerce").astype("Int64")
     out["sentence_id"] = pd.to_numeric(out["sentence_id"], errors="coerce").astype("Int64")
@@ -100,8 +101,9 @@ def normalize_data(df: pd.DataFrame) -> pd.DataFrame:
     out.loc[out["year"].notna() & (out["year"] > 1991), "period"] = "После 1991"
 
     text_columns = ["publication", "dictionary", "category", "matched_term"]
-    if "emotion" in out.columns:
-        text_columns.append("emotion")
+    for optional_col in ["emotion", "attitude"]:
+        if optional_col in out.columns:
+            text_columns.append(optional_col)
     for col in text_columns:
         out[col] = out[col].astype("string")
     return out
@@ -122,17 +124,14 @@ def read_uploaded_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
     raise ValueError("Поддерживаются CSV, XLSX и Parquet")
 
 
-def load_data() -> pd.DataFrame:
-    """
-    Cloud-friendly data loading.
+def load_data_file(
+    default_name: str,
+    secret_name: str,
+    uploader_key: str,
+) -> pd.DataFrame:
+    """Load one dashboard dataset from the app folder, with manual upload fallback."""
+    data_file = str(_get_secret(secret_name, default_name))
 
-    By default the app expects `all_publications.parquet` next to streamlit_app.py.
-    The filename can be changed with DATA_FILE in Streamlit secrets/environment.
-    If the file is absent, the app offers a manual upload as a fallback.
-    """
-    data_file = str(_get_secret("DATA_FILE", "all_publications.parquet"))
-
-    # Resolve relative paths from the folder containing this script, not from cwd.
     if not os.path.isabs(data_file):
         data_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), data_file)
 
@@ -146,13 +145,25 @@ def load_data() -> pd.DataFrame:
             st.stop()
 
     st.warning(
-        "Файл all_publications.parquet не найден рядом со streamlit_app.py. "
+        f"Файл {default_name} не найден рядом со streamlit_app.py. "
         "Добавьте его в репозиторий или загрузите файл вручную ниже."
     )
-    uploaded = st.file_uploader("Файл данных", type=["csv", "xlsx", "xls", "parquet"])
+    uploaded = st.file_uploader(
+        f"Файл данных: {default_name}",
+        type=["csv", "xlsx", "xls", "parquet"],
+        key=uploader_key,
+    )
     if uploaded is None:
-        st.stop()
+        return pd.DataFrame()
     return normalize_data(read_uploaded_file(uploaded.getvalue(), uploaded.name))
+
+
+def load_data() -> pd.DataFrame:
+    return load_data_file("all_publications.parquet", "DATA_FILE", "upload_soviet")
+
+
+def load_us_data() -> pd.DataFrame:
+    return load_data_file("all_publications_us.parquet", "DATA_FILE_US", "upload_us")
 
 
 def sorted_values(series: pd.Series) -> list[str]:
@@ -180,6 +191,87 @@ def year_bounds(df: pd.DataFrame) -> tuple[int, int]:
     return int(years.min()), int(years.max())
 
 
+def _reset_invalid_widget_state(key: str, is_valid) -> None:
+    """Remove stale Streamlit widget state before the widget is rendered.
+
+    Cascading filters change their available options/bounds after every rerun.
+    Streamlit keeps the previous widget value in session_state, so an old value
+    can become invalid for the newly filtered data. Clearing it here prevents
+    intermittent errors after changing an upstream filter.
+    """
+    if key not in st.session_state:
+        return
+    try:
+        valid = bool(is_valid(st.session_state[key]))
+    except Exception:
+        valid = False
+    if not valid:
+        del st.session_state[key]
+
+
+def safe_selectbox(label: str, options, *, key: str, **kwargs):
+    options = list(options)
+    if not options:
+        return None
+    _reset_invalid_widget_state(key, lambda value: value in options)
+    return st.selectbox(label, options=options, key=key, **kwargs)
+
+
+def safe_multiselect(label: str, options, *, key: str, default=None, **kwargs):
+    options = list(options)
+    option_set = set(options)
+
+    def _valid(value) -> bool:
+        if value is None:
+            return True
+        if not isinstance(value, (list, tuple, set)):
+            return False
+        return all(item in option_set for item in value)
+
+    _reset_invalid_widget_state(key, _valid)
+    if default is None:
+        default = []
+    return st.multiselect(label, options=options, default=default, key=key, **kwargs)
+
+
+def safe_year_slider(
+    label: str,
+    filtered_df: pd.DataFrame,
+    fallback_df: pd.DataFrame,
+    *,
+    key: str,
+) -> tuple[int, int]:
+    """Render a range slider without stale-state/min=max failures."""
+    source = filtered_df if not filtered_df.empty else fallback_df
+    ymin, ymax = year_bounds(source)
+
+    # A range slider cannot meaningfully operate when only one year is available.
+    # Remove any state left by an earlier wider slider and show the fixed year.
+    if ymin == ymax:
+        if key in st.session_state:
+            del st.session_state[key]
+        st.caption(f"{label}: {ymin}")
+        return (ymin, ymax)
+
+    def _valid(value) -> bool:
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            return False
+        try:
+            start, end = int(value[0]), int(value[1])
+        except (TypeError, ValueError):
+            return False
+        return ymin <= start <= end <= ymax
+
+    _reset_invalid_widget_state(key, _valid)
+    return st.slider(
+        label,
+        min_value=ymin,
+        max_value=ymax,
+        value=(ymin, ymax),
+        key=key,
+    )
+
+
 def apply_common_filters(
     df: pd.DataFrame,
     dictionary: str,
@@ -195,42 +287,43 @@ def apply_common_filters(
     return out
 
 
-def page_texts(df: pd.DataFrame) -> None:
-    st.subheader("Тексты")
+def page_texts(df: pd.DataFrame, key_prefix: str = "txt", title: str = "Тексты") -> None:
+    st.subheader(title)
 
     # First layer: dictionary/publication/period/year. Category and matched term cascade from it.
     c1, c2, c3, c4, c5, c6 = st.columns([1.0, 1.15, 1.15, 1.0, 0.85, 1.55])
 
     dictionaries = ["Все"] + sorted_values(df["dictionary"])
     with c1:
-        dictionary = st.selectbox("Словарь", dictionaries, key="txt_dictionary")
+        dictionary = safe_selectbox("Словарь", dictionaries, key=f"{key_prefix}_dictionary")
 
     base = filter_equal(df, "dictionary", dictionary)
 
     publications = ["Все"] + sorted_values(base["publication"])
     with c4:
-        publication = st.selectbox("Журнал", publications, key="txt_publication")
+        publication = safe_selectbox("Журнал", publications, key=f"{key_prefix}_publication")
     base = filter_equal(base, "publication", publication)
 
     periods = ["Все", "До 1991 включительно", "После 1991"]
     with c5:
-        period = st.selectbox("Период", periods, key="txt_period")
+        period = safe_selectbox("Период", periods, key=f"{key_prefix}_period")
     base = filter_equal(base, "period", period)
 
-    ymin, ymax = year_bounds(base if not base.empty else df)
     with c6:
-        years = st.slider("Год", ymin, ymax, (ymin, ymax), key="txt_years")
+        years = safe_year_slider(
+            "Год", base, df, key=f"{key_prefix}_years"
+        )
     base = base[base["year"].notna()]
     base = base[(base["year"].astype(int) >= years[0]) & (base["year"].astype(int) <= years[1])]
 
     categories = ["Все"] + sorted_values(base["category"])
     with c2:
-        category = st.selectbox("Категория", categories, key="txt_category")
+        category = safe_selectbox("Категория", categories, key=f"{key_prefix}_category")
     base2 = filter_equal(base, "category", category)
 
     terms = ["Все"] + sorted_values(base2["matched_term"])
     with c3:
-        matched_term = st.selectbox("Совпадающий термин", terms, key="txt_term")
+        matched_term = safe_selectbox("Совпадающий термин", terms, key=f"{key_prefix}_term")
 
     filtered = filter_equal(base2, "matched_term", matched_term)
     count = filtered["unique_sentence_id"].nunique(dropna=True)
@@ -268,8 +361,8 @@ def page_texts(df: pd.DataFrame) -> None:
     )
 
 
-def page_analytics(df: pd.DataFrame) -> None:
-    st.subheader("Анализ категорий")
+def page_analytics(df: pd.DataFrame, key_prefix: str = "an", title: str = "Анализ категорий") -> None:
+    st.subheader(title)
 
     c1, c2, c3, c4 = st.columns([1.1, 1.1, 0.9, 1.6])
 
@@ -278,33 +371,34 @@ def page_analytics(df: pd.DataFrame) -> None:
         st.warning("Нет значений dictionary")
         return
     with c1:
-        dictionary = st.selectbox("Словарь", dictionaries, key="an_dictionary")
+        dictionary = safe_selectbox("Словарь", dictionaries, key=f"{key_prefix}_dictionary")
 
     base = filter_equal(df, "dictionary", dictionary)
 
     publications = sorted_values(base["publication"])
     with c2:
-        selected_publications = st.multiselect(
+        selected_publications = safe_multiselect(
             "Журналы",
             options=publications,
             default=[],
-            key="an_publications",
+            key=f"{key_prefix}_publications",
             placeholder="Все издания",
             help="Можно выбрать несколько изданий. Если ничего не выбрано, используются все издания.",
         )
     base = filter_multi(base, "publication", selected_publications)
 
     with c3:
-        period = st.selectbox(
+        period = safe_selectbox(
             "Период",
             ["Все", "До 1991 включительно", "После 1991"],
-            key="an_period",
+            key=f"{key_prefix}_period",
         )
     base = filter_equal(base, "period", period)
 
-    ymin, ymax = year_bounds(base if not base.empty else df)
     with c4:
-        years = st.slider("Год", ymin, ymax, (ymin, ymax), key="an_years")
+        years = safe_year_slider(
+            "Год", base, df, key=f"{key_prefix}_years"
+        )
 
     base = base[base["year"].notna()]
     base = base[(base["year"].astype(int) >= years[0]) & (base["year"].astype(int) <= years[1])]
@@ -348,11 +442,11 @@ def page_analytics(df: pd.DataFrame) -> None:
 
         available_categories = cat_counts["category"].tolist()
         default_categories = available_categories[: min(8, len(available_categories))]
-        selected_categories = st.multiselect(
+        selected_categories = safe_multiselect(
             "Категории для динамики и долей",
             options=available_categories,
             default=default_categories,
-            key="an_categories",
+            key=f"{key_prefix}_categories",
             help="Можно выбрать несколько категорий. Топ-10 выше от этого выбора не меняется.",
         )
 
@@ -426,7 +520,7 @@ def page_publication_analytics(df: pd.DataFrame) -> None:
         "Термин": "matched_term",
     }
     with c1:
-        dimension_label = st.selectbox(
+        dimension_label = safe_selectbox(
             "Что анализируем",
             options=list(dimension_labels),
             key="pub_dimension",
@@ -435,7 +529,7 @@ def page_publication_analytics(df: pd.DataFrame) -> None:
 
     available_values = sorted_values(df[dimension])
     with c2:
-        selected_values = st.multiselect(
+        selected_values = safe_multiselect(
             dimension_label,
             options=available_values,
             default=[],
@@ -451,7 +545,7 @@ def page_publication_analytics(df: pd.DataFrame) -> None:
 
     publications = sorted_values(base["publication"])
     with c3:
-        selected_publications = st.multiselect(
+        selected_publications = safe_multiselect(
             "Издания",
             options=publications,
             default=[],
@@ -462,16 +556,15 @@ def page_publication_analytics(df: pd.DataFrame) -> None:
     base = filter_multi(base, "publication", selected_publications)
 
     with c4:
-        period = st.selectbox(
+        period = safe_selectbox(
             "Период",
             ["Все", "До 1991 включительно", "После 1991"],
             key="pub_period",
         )
     base = filter_equal(base, "period", period)
 
-    ymin, ymax = year_bounds(base if not base.empty else df)
     with c5:
-        years = st.slider("Год", ymin, ymax, (ymin, ymax), key="pub_years")
+        years = safe_year_slider("Год", base, df, key="pub_years")
 
     base = base[base["year"].notna()].copy()
     base = base[(base["year"].astype(int) >= years[0]) & (base["year"].astype(int) <= years[1])]
@@ -621,7 +714,7 @@ def page_attitudes(df: pd.DataFrame) -> None:
 
     publications = sorted_values(relation_base["publication"])
     with c1:
-        selected_publications = st.multiselect(
+        selected_publications = safe_multiselect(
             "Издания",
             options=publications,
             default=[],
@@ -632,16 +725,15 @@ def page_attitudes(df: pd.DataFrame) -> None:
     relation_base = filter_multi(relation_base, "publication", selected_publications)
 
     with c2:
-        period = st.selectbox(
+        period = safe_selectbox(
             "Период",
             ["Все", "До 1991 включительно", "После 1991"],
             key="rel_period",
         )
     relation_base = filter_equal(relation_base, "period", period)
 
-    ymin, ymax = year_bounds(relation_base if not relation_base.empty else df)
     with c3:
-        years = st.slider("Год", ymin, ymax, (ymin, ymax), key="rel_years")
+        years = safe_year_slider("Год", relation_base, df, key="rel_years")
 
     relation_base = relation_base[relation_base["year"].notna()].copy()
     relation_base = relation_base[
@@ -720,23 +812,191 @@ def page_attitudes(df: pd.DataFrame) -> None:
         "Доли рассчитываются по уникальным сочетаниям «издание + sentence_id» внутри каждой категории emotion."
     )
 
+
+def page_us_emotions(df: pd.DataFrame) -> None:
+    st.subheader("Эмоции и отношение")
+
+    if df.empty:
+        st.info("Данные американских публикаций не загружены.")
+        return
+
+    author_dictionary = "american_author_emotions_to_russia"
+    imagined_dictionary = "imagined_russian_attitudes_to_usa"
+
+    available = set(df["dictionary"].dropna().astype(str).unique())
+    missing = [
+        name for name in [author_dictionary, imagined_dictionary]
+        if name not in available
+    ]
+    if missing:
+        st.warning("В данных не найдены словари: " + ", ".join(missing))
+
+    relation_base = df[
+        df["dictionary"].astype("string").isin(
+            [author_dictionary, imagined_dictionary]
+        )
+    ].copy()
+
+    if relation_base.empty:
+        st.info("Для словарей с эмоциями и отношением данных нет.")
+        return
+
+    c1, c2, c3 = st.columns([1.6, 0.9, 1.5])
+
+    publications = sorted_values(relation_base["publication"])
+    with c1:
+        selected_publications = safe_multiselect(
+            "Издания",
+            options=publications,
+            default=[],
+            key="us_em_publications",
+            placeholder="Все издания",
+            help="Если ничего не выбрано, используются все издания.",
+        )
+    relation_base = filter_multi(relation_base, "publication", selected_publications)
+
+    with c2:
+        period = safe_selectbox(
+            "Период",
+            ["Все", "До 1991 включительно", "После 1991"],
+            key="us_em_period",
+        )
+    relation_base = filter_equal(relation_base, "period", period)
+
+    with c3:
+        years = safe_year_slider("Год", relation_base, df, key="us_em_years")
+
+    relation_base = relation_base[relation_base["year"].notna()].copy()
+    relation_base = relation_base[
+        (relation_base["year"].astype(int) >= years[0])
+        & (relation_base["year"].astype(int) <= years[1])
+    ]
+
+    if relation_base.empty:
+        st.info("По выбранным фильтрам данных нет.")
+        return
+
+    left, right = st.columns(2)
+
+    def render_pie(
+        container,
+        dictionary: str,
+        value_column: str,
+        title: str,
+        legend_title: str,
+    ) -> None:
+        with container:
+            st.markdown(f"### {title}")
+
+            if value_column not in relation_base.columns:
+                st.warning(f"В данных нет колонки {value_column}.")
+                return
+
+            subset = relation_base[
+                relation_base["dictionary"].astype("string") == dictionary
+            ].copy()
+            subset = subset.dropna(subset=[value_column])
+            subset = subset[subset[value_column].astype(str).str.strip() != ""]
+
+            if subset.empty:
+                st.info("По выбранным фильтрам данных нет.")
+                return
+
+            pie_data = (
+                subset.groupby(value_column, as_index=False)["unique_sentence_id"]
+                .nunique()
+                .rename(columns={"unique_sentence_id": "count"})
+                .sort_values("count", ascending=False)
+            )
+
+            fig = px.pie(
+                pie_data,
+                names=value_column,
+                values="count",
+                hole=0,
+            )
+            fig.update_traces(
+                textinfo="percent+label",
+                hovertemplate=(
+                    "%{label}<br>"
+                    "%{value} предложений<br>"
+                    "%{percent}<extra></extra>"
+                ),
+            )
+            fig.update_layout(
+                height=520,
+                margin=dict(l=5, r=5, t=10, b=5),
+                legend_title_text=legend_title,
+            )
+            st.plotly_chart(
+                fig,
+                use_container_width=True,
+                config={"displayModeBar": False},
+            )
+
+            total = subset["unique_sentence_id"].nunique(dropna=True)
+            st.caption(f"Уникальных предложений: {total:,}".replace(",", " "))
+
+    render_pie(
+        left,
+        author_dictionary,
+        "emotion",
+        "Эмоции американских авторов по отношению к СССР/России",
+        "Эмоция",
+    )
+    render_pie(
+        right,
+        imagined_dictionary,
+        "attitude",
+        "Воображаемое отношение русских к США",
+        "Отношение",
+    )
+
+    st.caption(
+        "Доли рассчитываются по уникальным сочетаниям «издание + sentence_id» "
+        "отдельно для каждого словаря."
+    )
+
 def main() -> None:
     require_shared_password()
     df = load_data()
+    df_us = load_us_data()
 
-    st.title("Анализ советских журналов")
+    st.title("Анализ советских и американских журналов")
 
-    tab_texts, tab_analytics, tab_publications, tab_attitudes = st.tabs(
-        ["Тексты", "Анализ категорий", "Аналитика изданий", "Отношение"]
+    section_soviet, section_us = st.tabs(
+        ["Советские публикации", "Американские публикации"]
     )
-    with tab_texts:
-        page_texts(df)
-    with tab_analytics:
-        page_analytics(df)
-    with tab_publications:
-        page_publication_analytics(df)
-    with tab_attitudes:
-        page_attitudes(df)
+
+    with section_soviet:
+        tab_texts, tab_analytics, tab_publications, tab_attitudes = st.tabs(
+            ["Тексты", "Анализ категорий", "Аналитика изданий", "Отношение"]
+        )
+        with tab_texts:
+            page_texts(df, key_prefix="txt", title="Тексты")
+        with tab_analytics:
+            page_analytics(df, key_prefix="an", title="Анализ категорий")
+        with tab_publications:
+            page_publication_analytics(df)
+        with tab_attitudes:
+            page_attitudes(df)
+
+    with section_us:
+        if df_us.empty:
+            st.info(
+                "Добавьте all_publications_us.parquet рядом со streamlit_app.py "
+                "или загрузите его через форму выше."
+            )
+        else:
+            us_texts, us_analytics, us_emotions = st.tabs(
+                ["Тексты", "Анализ категорий", "Эмоции"]
+            )
+            with us_texts:
+                page_texts(df_us, key_prefix="us_txt", title="Тексты американских публикаций")
+            with us_analytics:
+                page_analytics(df_us, key_prefix="us_an", title="Анализ категорий американских публикаций")
+            with us_emotions:
+                page_us_emotions(df_us)
 
 
 if __name__ == "__main__":
