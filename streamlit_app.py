@@ -1007,154 +1007,6 @@ def page_us_emotions(df: pd.DataFrame) -> None:
     )
 
 
-def page_us_cold_war_outcomes(df: pd.DataFrame) -> None:
-    st.subheader("Итоги холодной войны")
-
-    if df.empty:
-        st.info("Данные американских публикаций не загружены.")
-        return
-
-    # The cold-war classifier is stored as a separate dictionary in the US corpus.
-    # Prefer the known names, but also detect compatible names so the page keeps
-    # working if the pipeline writes a slightly different dictionary label.
-    known_names = [
-        "cold_war_outcome_us_media",
-        "qwen_cold_war_outcome_us_media",
-        "cold_war_outcome",
-    ]
-    available = sorted_values(df["dictionary"])
-    detected = []
-    for name in available:
-        low = name.casefold()
-        if name in known_names or (("cold" in low and "war" in low) and ("outcome" in low or "result" in low)):
-            detected.append(name)
-
-    if not detected:
-        st.warning(
-            "В all_publications_us.parquet не найден словарь с итогами холодной войны. "
-            "Ожидается название вроде cold_war_outcome_us_media. "
-            "Данные не удаляются приложением — страница показывает только то, что есть в parquet."
-        )
-        return
-
-    if len(detected) == 1:
-        dictionary = detected[0]
-    else:
-        dictionary = safe_selectbox(
-            "Словарь",
-            detected,
-            key="us_cw_dictionary",
-        )
-
-    base = df[df["dictionary"].astype("string") == dictionary].copy()
-    if base.empty:
-        st.info("Для выбранного словаря данных нет.")
-        return
-
-    c1, c2, c3 = st.columns([1.6, 0.9, 1.5])
-
-    publications = sorted_values(base["publication"])
-    with c1:
-        selected_publications = safe_multiselect(
-            "Издания",
-            options=publications,
-            default=[],
-            key="us_cw_publications",
-            placeholder="Все издания",
-            help="Если ничего не выбрано, используются все издания.",
-        )
-    base = filter_multi(base, "publication", selected_publications)
-
-    with c2:
-        period = safe_selectbox(
-            "Период",
-            ["Все", "До 1991 включительно", "После 1991"],
-            key="us_cw_period",
-        )
-    base = filter_equal(base, "period", period)
-
-    with c3:
-        years = safe_year_slider("Год", base, df, key="us_cw_years")
-
-    base = base[base["year"].notna()].copy()
-    base = base[
-        (base["year"].astype(int) >= years[0])
-        & (base["year"].astype(int) <= years[1])
-    ]
-    base = base.dropna(subset=["category"])
-    base = base[base["category"].astype(str).str.strip() != ""]
-
-    if base.empty:
-        st.info("По выбранным фильтрам данных нет.")
-        return
-
-    counts = (
-        base.groupby("category", as_index=False)["unique_sentence_id"]
-        .nunique()
-        .rename(columns={"unique_sentence_id": "count"})
-        .sort_values("count", ascending=False)
-    )
-
-    left, right = st.columns([1.0, 1.6])
-
-    with left:
-        st.markdown("### Распределение итогов")
-        fig_pie = px.pie(
-            counts,
-            names="category",
-            values="count",
-            hole=0,
-        )
-        fig_pie.update_traces(
-            textinfo="percent+label",
-            hovertemplate=(
-                "%{label}<br>"
-                "%{value} предложений<br>"
-                "%{percent}<extra></extra>"
-            ),
-        )
-        fig_pie.update_layout(
-            height=470,
-            margin=dict(l=5, r=5, t=10, b=5),
-            legend_title_text="Итог",
-        )
-        st.plotly_chart(fig_pie, width="stretch", config={"displayModeBar": False})
-
-    with right:
-        st.markdown("### Динамика по годам")
-        line_data = (
-            base.groupby(["year", "category"], as_index=False)["unique_sentence_id"]
-            .nunique()
-            .rename(columns={"unique_sentence_id": "count"})
-            .sort_values(["year", "count"], ascending=[True, False])
-        )
-        fig_line = px.line(
-            line_data,
-            x="year",
-            y="count",
-            color="category",
-            labels={
-                "year": "Год",
-                "count": "Количество упоминаний",
-                "category": "Итог",
-            },
-        )
-        fig_line.update_traces(hovertemplate="%{fullData.name}: %{y}<extra></extra>")
-        fig_line.update_layout(
-            height=470,
-            hovermode="x unified",
-            margin=dict(l=15, r=15, t=10, b=10),
-            legend_title_text="Итог",
-        )
-        fig_line.update_xaxes(dtick=5)
-        st.plotly_chart(fig_line, width="stretch", config={"displayModeBar": True})
-
-    total = base["unique_sentence_id"].nunique(dropna=True)
-    st.caption(
-        f"Уникальных предложений: {total:,}. Словарь: {dictionary}. "
-        "Категории берутся напрямую из колонки category."
-        .replace(",", " ")
-    )
 
 def main() -> None:
     require_shared_password()
@@ -1205,7 +1057,7 @@ def main() -> None:
 
         page = st.radio(
             "Раздел",
-            ["Тексты", "Анализ категорий", "Эмоции", "Итоги холодной войны"],
+            ["Тексты", "Анализ категорий", "Эмоции"],
             horizontal=True,
             key="us_page",
         )
@@ -1222,10 +1074,8 @@ def main() -> None:
                 key_prefix="us_an",
                 title="Анализ категорий американских публикаций",
             )
-        elif page == "Эмоции":
-            page_us_emotions(df_us)
         else:
-            page_us_cold_war_outcomes(df_us)
+            page_us_emotions(df_us)
 
 if __name__ == "__main__":
     main()
