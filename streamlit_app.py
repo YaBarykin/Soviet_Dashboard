@@ -73,10 +73,15 @@ def require_shared_password() -> None:
     st.stop()
 
 
-@st.cache_data(show_spinner="Загрузка данных…")
+@st.cache_data(show_spinner="Загрузка данных…", max_entries=1)
 def load_parquet_data(path: str) -> pd.DataFrame:
-    """Load the bundled dataset used by the deployed dashboard."""
-    return pd.read_parquet(path)
+    """Load and normalize one bundled dataset.
+
+    max_entries=1 is deliberate: only the currently selected corpus is kept in
+    Streamlit's data cache, which prevents both large parquet datasets from
+    accumulating in memory after switching sections.
+    """
+    return normalize_data(pd.read_parquet(path))
 
 
 def normalize_data(df: pd.DataFrame) -> pd.DataFrame:
@@ -109,7 +114,7 @@ def normalize_data(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(show_spinner=False, max_entries=1)
 def read_uploaded_file(file_bytes: bytes, filename: str) -> pd.DataFrame:
     from io import BytesIO
 
@@ -137,7 +142,7 @@ def load_data_file(
 
     if os.path.exists(data_file):
         try:
-            return normalize_data(load_parquet_data(data_file))
+            return load_parquet_data(data_file)
         except Exception as exc:
             st.error(f"Не удалось прочитать файл данных: {os.path.basename(data_file)}")
             with st.expander("Техническая информация"):
@@ -163,7 +168,39 @@ def load_data() -> pd.DataFrame:
 
 
 def load_us_data() -> pd.DataFrame:
-    return load_data_file("all_publications_us.parquet", "DATA_FILE_US", "upload_us")
+    df = load_data_file("all_publications_us.parquet", "DATA_FILE_US", "upload_us")
+    if df.empty or "dictionary" not in df.columns:
+        return df
+
+    # The US corpus contains two versions of the same foreign-policy dictionary.
+    # Merge them into one canonical label so every American-media page treats
+    # their rows as a single dictionary.  Normalisation also covers common
+    # separators/prefixes and the historical misspelling "sementic".
+    dictionary_norm = (
+        df["dictionary"]
+        .astype("string")
+        .str.strip()
+        .str.casefold()
+        .str.replace("_", " ", regex=False)
+        .str.replace("-", " ", regex=False)
+        .str.replace(r"\s+", " ", regex=True)
+    )
+
+    foreign_policy_mask = (
+        dictionary_norm.eq("foreign policy")
+        | dictionary_norm.eq("foreign policy semantic")
+        | dictionary_norm.eq("foreign policy sementic")
+        | dictionary_norm.eq("us foreign policy")
+        | dictionary_norm.eq("us foreign policy semantic")
+        | dictionary_norm.eq("us foreign policy sementic")
+        | dictionary_norm.str.fullmatch(r"(?:us )?foreign policy (?:semantic|sementic)", na=False)
+    )
+
+    if foreign_policy_mask.any():
+        df = df.copy()
+        df.loc[foreign_policy_mask, "dictionary"] = "foreign policy"
+
+    return df
 
 
 def sorted_values(series: pd.Series) -> list[str]:
@@ -345,9 +382,21 @@ def page_texts(df: pd.DataFrame, key_prefix: str = "txt", title: str = "Текс
         }
     )
 
+    # Sending hundreds of thousands of rows to the browser on every filter
+    # rerun can exhaust Community Cloud resources. Keep the exact count above,
+    # but render only a manageable preview; filters can be used to narrow it.
+    max_display_rows = 5000
+    total_display_rows = len(display)
+    display_preview = display.head(max_display_rows)
+    if total_display_rows > max_display_rows:
+        st.caption(
+            f"Показаны первые {max_display_rows:,} строк из {total_display_rows:,}. "
+            "Используйте фильтры, чтобы сузить выборку.".replace(",", " ")
+        )
+
     st.dataframe(
-        display,
-        use_container_width=True,
+        display_preview,
+        width="stretch",
         hide_index=True,
         height=610,
         column_config={
@@ -438,7 +487,7 @@ def page_analytics(df: pd.DataFrame, key_prefix: str = "an", title: str = "Ан�
             labels={"count": "Количество предложений", "category": ""},
         )
         fig_bar.update_layout(height=315, margin=dict(l=10, r=10, t=10, b=10), showlegend=False)
-        st.plotly_chart(fig_bar, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(fig_bar, width="stretch", config={"displayModeBar": False})
 
         available_categories = cat_counts["category"].tolist()
         default_categories = available_categories[: min(8, len(available_categories))]
@@ -465,7 +514,7 @@ def page_analytics(df: pd.DataFrame, key_prefix: str = "an", title: str = "Ан�
         )
         fig_pie.update_traces(textinfo="percent", hovertemplate="%{label}<br>%{value} предложений<br>%{percent}<extra></extra>")
         fig_pie.update_layout(height=340, margin=dict(l=5, r=5, t=5, b=5), legend_title_text="Категория")
-        st.plotly_chart(fig_pie, use_container_width=True, config={"displayModeBar": False})
+        st.plotly_chart(fig_pie, width="stretch", config={"displayModeBar": False})
 
     with right:
         st.markdown("### Распределение категорий по годам")
@@ -503,7 +552,7 @@ def page_analytics(df: pd.DataFrame, key_prefix: str = "an", title: str = "Ан�
             legend_title_text="Категория",
         )
         fig_line.update_xaxes(dtick=5)
-        st.plotly_chart(fig_line, use_container_width=True, config={"displayModeBar": True})
+        st.plotly_chart(fig_line, width="stretch", config={"displayModeBar": True})
 
         st.caption("Количество считается по уникальным сочетаниям «издание + sentence_id», как мера Sentences Count в исходном Power BI.")
 
@@ -596,7 +645,7 @@ def page_publication_analytics(df: pd.DataFrame) -> None:
         showlegend=False,
     )
     fig_bar.update_xaxes(categoryorder="total descending")
-    st.plotly_chart(fig_bar, use_container_width=True, config={"displayModeBar": False})
+    st.plotly_chart(fig_bar, width="stretch", config={"displayModeBar": False})
 
     # Yearly dynamics with publications as lines. Fill missing publication/year combinations with zeros
     # so the chart does not connect non-adjacent observations across years with no mentions.
@@ -670,7 +719,7 @@ def page_publication_analytics(df: pd.DataFrame) -> None:
         legend_title_text="Издание",
     )
     fig_line.update_xaxes(dtick=5)
-    st.plotly_chart(fig_line, use_container_width=True, config={"displayModeBar": True})
+    st.plotly_chart(fig_line, width="stretch", config={"displayModeBar": True})
 
     selection_text = ", ".join(selected_values) if selected_values else "все значения"
     st.caption(
@@ -788,7 +837,7 @@ def page_attitudes(df: pd.DataFrame) -> None:
             )
             st.plotly_chart(
                 fig,
-                use_container_width=True,
+                width="stretch",
                 config={"displayModeBar": False},
             )
 
@@ -930,7 +979,7 @@ def page_us_emotions(df: pd.DataFrame) -> None:
             )
             st.plotly_chart(
                 fig,
-                use_container_width=True,
+                width="stretch",
                 config={"displayModeBar": False},
             )
 
@@ -957,47 +1006,226 @@ def page_us_emotions(df: pd.DataFrame) -> None:
         "отдельно для каждого словаря."
     )
 
+
+def page_us_cold_war_outcomes(df: pd.DataFrame) -> None:
+    st.subheader("Итоги холодной войны")
+
+    if df.empty:
+        st.info("Данные американских публикаций не загружены.")
+        return
+
+    # The cold-war classifier is stored as a separate dictionary in the US corpus.
+    # Prefer the known names, but also detect compatible names so the page keeps
+    # working if the pipeline writes a slightly different dictionary label.
+    known_names = [
+        "cold_war_outcome_us_media",
+        "qwen_cold_war_outcome_us_media",
+        "cold_war_outcome",
+    ]
+    available = sorted_values(df["dictionary"])
+    detected = []
+    for name in available:
+        low = name.casefold()
+        if name in known_names or (("cold" in low and "war" in low) and ("outcome" in low or "result" in low)):
+            detected.append(name)
+
+    if not detected:
+        st.warning(
+            "В all_publications_us.parquet не найден словарь с итогами холодной войны. "
+            "Ожидается название вроде cold_war_outcome_us_media. "
+            "Данные не удаляются приложением — страница показывает только то, что есть в parquet."
+        )
+        return
+
+    if len(detected) == 1:
+        dictionary = detected[0]
+    else:
+        dictionary = safe_selectbox(
+            "Словарь",
+            detected,
+            key="us_cw_dictionary",
+        )
+
+    base = df[df["dictionary"].astype("string") == dictionary].copy()
+    if base.empty:
+        st.info("Для выбранного словаря данных нет.")
+        return
+
+    c1, c2, c3 = st.columns([1.6, 0.9, 1.5])
+
+    publications = sorted_values(base["publication"])
+    with c1:
+        selected_publications = safe_multiselect(
+            "Издания",
+            options=publications,
+            default=[],
+            key="us_cw_publications",
+            placeholder="Все издания",
+            help="Если ничего не выбрано, используются все издания.",
+        )
+    base = filter_multi(base, "publication", selected_publications)
+
+    with c2:
+        period = safe_selectbox(
+            "Период",
+            ["Все", "До 1991 включительно", "После 1991"],
+            key="us_cw_period",
+        )
+    base = filter_equal(base, "period", period)
+
+    with c3:
+        years = safe_year_slider("Год", base, df, key="us_cw_years")
+
+    base = base[base["year"].notna()].copy()
+    base = base[
+        (base["year"].astype(int) >= years[0])
+        & (base["year"].astype(int) <= years[1])
+    ]
+    base = base.dropna(subset=["category"])
+    base = base[base["category"].astype(str).str.strip() != ""]
+
+    if base.empty:
+        st.info("По выбранным фильтрам данных нет.")
+        return
+
+    counts = (
+        base.groupby("category", as_index=False)["unique_sentence_id"]
+        .nunique()
+        .rename(columns={"unique_sentence_id": "count"})
+        .sort_values("count", ascending=False)
+    )
+
+    left, right = st.columns([1.0, 1.6])
+
+    with left:
+        st.markdown("### Распределение итогов")
+        fig_pie = px.pie(
+            counts,
+            names="category",
+            values="count",
+            hole=0,
+        )
+        fig_pie.update_traces(
+            textinfo="percent+label",
+            hovertemplate=(
+                "%{label}<br>"
+                "%{value} предложений<br>"
+                "%{percent}<extra></extra>"
+            ),
+        )
+        fig_pie.update_layout(
+            height=470,
+            margin=dict(l=5, r=5, t=10, b=5),
+            legend_title_text="Итог",
+        )
+        st.plotly_chart(fig_pie, width="stretch", config={"displayModeBar": False})
+
+    with right:
+        st.markdown("### Динамика по годам")
+        line_data = (
+            base.groupby(["year", "category"], as_index=False)["unique_sentence_id"]
+            .nunique()
+            .rename(columns={"unique_sentence_id": "count"})
+            .sort_values(["year", "count"], ascending=[True, False])
+        )
+        fig_line = px.line(
+            line_data,
+            x="year",
+            y="count",
+            color="category",
+            labels={
+                "year": "Год",
+                "count": "Количество упоминаний",
+                "category": "Итог",
+            },
+        )
+        fig_line.update_traces(hovertemplate="%{fullData.name}: %{y}<extra></extra>")
+        fig_line.update_layout(
+            height=470,
+            hovermode="x unified",
+            margin=dict(l=15, r=15, t=10, b=10),
+            legend_title_text="Итог",
+        )
+        fig_line.update_xaxes(dtick=5)
+        st.plotly_chart(fig_line, width="stretch", config={"displayModeBar": True})
+
+    total = base["unique_sentence_id"].nunique(dropna=True)
+    st.caption(
+        f"Уникальных предложений: {total:,}. Словарь: {dictionary}. "
+        "Категории берутся напрямую из колонки category."
+        .replace(",", " ")
+    )
+
 def main() -> None:
     require_shared_password()
-    df = load_data()
-    df_us = load_us_data()
 
     st.title("Анализ советских и американских журналов")
 
-    section_soviet, section_us = st.tabs(
-        ["Советские публикации", "Американские публикации"]
+    # IMPORTANT: st.tabs executes the body of every tab on every rerun. With two
+    # large corpora and several Plotly/DataFrame views this can create large memory
+    # and CPU spikes on Community Cloud. Radio navigation is intentionally used
+    # here so that only the visible corpus and visible page are evaluated.
+    section = st.radio(
+        "Корпус",
+        ["Советские публикации", "Американские публикации"],
+        horizontal=True,
+        key="active_corpus",
     )
 
-    with section_soviet:
-        tab_texts, tab_analytics, tab_publications, tab_attitudes = st.tabs(
-            ["Тексты", "Анализ категорий", "Аналитика изданий", "Отношение"]
+    if section == "Советские публикации":
+        df = load_data()
+        if df.empty:
+            st.info("Нет данных для советских публикаций.")
+            return
+
+        page = st.radio(
+            "Раздел",
+            ["Тексты", "Анализ категорий", "Аналитика изданий", "Отношение"],
+            horizontal=True,
+            key="soviet_page",
         )
-        with tab_texts:
+
+        if page == "Тексты":
             page_texts(df, key_prefix="txt", title="Тексты")
-        with tab_analytics:
+        elif page == "Анализ категорий":
             page_analytics(df, key_prefix="an", title="Анализ категорий")
-        with tab_publications:
+        elif page == "Аналитика изданий":
             page_publication_analytics(df)
-        with tab_attitudes:
+        else:
             page_attitudes(df)
 
-    with section_us:
+    else:
+        df_us = load_us_data()
         if df_us.empty:
             st.info(
                 "Добавьте all_publications_us.parquet рядом со streamlit_app.py "
                 "или загрузите его через форму выше."
             )
-        else:
-            us_texts, us_analytics, us_emotions = st.tabs(
-                ["Тексты", "Анализ категорий", "Эмоции"]
-            )
-            with us_texts:
-                page_texts(df_us, key_prefix="us_txt", title="Тексты американских публикаций")
-            with us_analytics:
-                page_analytics(df_us, key_prefix="us_an", title="Анализ категорий американских публикаций")
-            with us_emotions:
-                page_us_emotions(df_us)
+            return
 
+        page = st.radio(
+            "Раздел",
+            ["Тексты", "Анализ категорий", "Эмоции", "Итоги холодной войны"],
+            horizontal=True,
+            key="us_page",
+        )
+
+        if page == "Тексты":
+            page_texts(
+                df_us,
+                key_prefix="us_txt",
+                title="Тексты американских публикаций",
+            )
+        elif page == "Анализ категорий":
+            page_analytics(
+                df_us,
+                key_prefix="us_an",
+                title="Анализ категорий американских публикаций",
+            )
+        elif page == "Эмоции":
+            page_us_emotions(df_us)
+        else:
+            page_us_cold_war_outcomes(df_us)
 
 if __name__ == "__main__":
     main()
